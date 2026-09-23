@@ -1,0 +1,33 @@
+{
+  "resourceType": "Bundle",
+  "type": "transaction",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "Patient",
+        "identifier": [
+          {
+            "system": "sysA",
+            "value": "P1",
+            "type": {"coding": [{"code": "IDCARD"}]}
+          }
+        ],
+        "name": [{"text": "Zhang San"}],
+        "telecom": [{"system": "phone", "value": "13800000000"}],
+        "gender": "male",
+        "birthDate": "1990-01-01"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "identifier": [{"system": "sysA", "value": "O1"}],
+        "status": "final",
+        "subject": {"reference": "Patient/P1"},
+        "code": {"coding": [{"system": "http://loinc.org", "code": "2345-7"}]},
+        "valueQuantity": {"value": 180.156, "unit": "mg/dL"},
+        "effectiveDateTime": "2026-09-24T08:00:00"
+      }
+    }
+  ]
+}

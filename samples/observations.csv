@@ -1,0 +1,3 @@
+source_system,patient_id,patient_name,id_number,phone,observation_id,test_code,value,unit,effective_time,gender,birth_date,status,encounter_id
+sysA,P2,Li Si,310101199002022345,13900001111,O2,HGB,13.2,g/dL,2026-09-24T09:00:00,female,1990-02-02,final,E2
+sysA,P3,Wang Wu,320101198503034567,13700007777,O3,CREA,1.0,mg/dL,2026-09-24T09:30:00,male,1985-03-03,preliminary,
