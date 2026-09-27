@@ -17,6 +17,7 @@ from app.errors import RecordRejectedError
 from app.masking import fingerprint_payload, mask_sensitive_context
 from app.models import (
     BatchResult,
+    PendingStatus,
     RecordOutcome,
     RecordResult,
     Rejection,
@@ -109,7 +110,11 @@ class IngestService:
         payload: str,
         exc: RecordRejectedError,
     ) -> str | None:
-        """把被拒记录安全地送入待处理区；容量满且无法淘汰时记录告警但不影响批次。"""
+        """把被拒记录送入待处理区。
+
+        当前容量策略保证总能腾出位置（必要时淘汰最早记录并归档），因此正常路径
+        一定返回 pending_id；QuarantineFullError 的兜底分支保留仅为防御未来改动。
+        """
         rejection = exc.rejection
         fmt = detect_format(payload)
         # 待处理区上下文统一做姓名+数字标识的强脱敏（遮蔽片段也以其为准）
@@ -158,6 +163,16 @@ class IngestService:
         if state == "not_found":
             logger.info("pending_id=%s 重放=not_found", pending_id)
             return ReplayResult(pending_id=pending_id, outcome=ReplayOutcome.NOT_FOUND)
+        if state == "evicted":
+            logger.info(
+                "pending_id=%s 重放=evicted（已被容量淘汰归档，不可重放）", pending_id
+            )
+            return ReplayResult(
+                pending_id=pending_id,
+                outcome=ReplayOutcome.EVICTED,
+                reason=record.reason.value,
+                detail="记录已被容量淘汰，仅保留可追溯信息，不能再重放",
+            )
         if state == "already_resolved":
             logger.info("pending_id=%s 重放=already_resolved（幂等命中）", pending_id)
             return ReplayResult(pending_id=pending_id, outcome=ReplayOutcome.ALREADY_RESOLVED)
@@ -212,19 +227,55 @@ class IngestService:
             ingest_outcome=outcome.value,
         )
 
-    def replay_pending(self, reason: RejectReason | None = None) -> ReplayBatchResult:
-        """对待处理区中的 pending 记录批量重放（可按失败类别限定）。
+    def replay_pending(
+        self,
+        reason: RejectReason | None = None,
+        *,
+        limit: int | None = None,
+    ) -> ReplayBatchResult:
+        """对待处理区记录批量重放（可按失败类别限定、可限制本轮处理条数）。
 
-        逐条复用 replay_one，因此同样幂等且并发安全；重复触发只会让已解决者
-        命中 already_resolved，进行中者命中 skipped_busy，不会产生重复记录。
+        候选 = pending 记录（reason 过滤）+ resolved 记录（此前已解决者），顺序
+        上 pending 优先。对每条候选都给出独立结论，从而区分四种跟进情况：
+
+        - resolved：本轮重放通过并入库；
+        - still_failed：依然失败，继续留在待处理区；
+        - already_resolved：此前就已解决，本轮属于重复触发；
+        - not_processed：本轮还没处理到（超出 ``limit``，或并发占用被跳过）。
+
+        逐条复用 replay_one，因此同样幂等且并发安全。
         """
-        candidates = self._quarantine.candidates(reason)
-        batch = ReplayBatchResult(triggered=len(candidates))
-        for record in candidates:
+        targets = self._quarantine.replay_targets(reason)
+        if limit is not None:
+            limit = max(0, int(limit))
+        batch = ReplayBatchResult(triggered=len(targets), limit=limit)
+        pending_processed = 0
+        for record in targets:
+            # limit 只约束需要真正重新解析判定的 pending 记录；
+            # resolved 记录是廉价的幂等查询，始终给出 already_resolved。
+            if (
+                record.status is PendingStatus.PENDING
+                and limit is not None
+                and pending_processed >= limit
+            ):
+                batch.results.append(
+                    ReplayResult(
+                        pending_id=record.pending_id,
+                        outcome=ReplayOutcome.NOT_PROCESSED,
+                        reason=record.reason.value,
+                        detail="本轮批量重放未处理到（超出本轮处理上限），留待后续批次",
+                    )
+                )
+                continue
+            if record.status is PendingStatus.PENDING:
+                pending_processed += 1
             batch.results.append(self.replay_one(record.pending_id))
+        batch.processed = pending_processed
         logger.info(
-            "批量重放 候选=%d 结果分布=%s",
+            "批量重放 候选=%d 实际处理=%d 四类统计=%s 细粒度=%s",
             batch.triggered,
+            batch.processed,
+            batch.summary(),
             batch.counts(),
         )
         return batch

@@ -35,6 +35,7 @@ class RegisterAliasRequest(BaseModel):
 
 class BatchReplayRequest(BaseModel):
     reason: str | None = None  # 可选：只重放某一失败类别
+    limit: int | None = None   # 可选：本轮最多实际重放的条数，超出者结论为 not_processed
 
 
 def _role(x_role: str | None) -> Role:
@@ -62,7 +63,10 @@ def _pending_status(value: str | None) -> PendingStatus | None:
     try:
         return PendingStatus(value)
     except ValueError:
-        raise HTTPException(status_code=422, detail=f"非法状态: {value}；可选 pending/resolved")
+        raise HTTPException(
+            status_code=422,
+            detail=f"非法状态: {value}；可选 pending/resolved/evicted",
+        )
 
 
 def create_app(
@@ -140,13 +144,14 @@ def create_app(
         require(_role(x_role), "read_quarantine")
         record = service.quarantine.get(pending_id)
         if record is None:
-            raise HTTPException(status_code=404, detail="待处理记录不存在或已被容量淘汰")
+            raise HTTPException(status_code=404, detail="待处理记录不存在")
         return record.to_view()
 
     @app.post("/quarantine/records/{pending_id}/replay", response_model=None)
     def replay_one(pending_id: str, x_role: str | None = Header(default=None)):
         require(_role(x_role), "manage_quarantine")
         result = service.replay_one(pending_id)
+        # 只有真正不存在才 404；evicted 是明确的业务结论，返回 200 便于跟进
         status_code = 404 if result.outcome.value == "not_found" else 200
         return JSONResponse(
             status_code=status_code,
@@ -162,10 +167,15 @@ def create_app(
     @app.post("/quarantine/replay", response_model=None)
     def replay_batch(body: BatchReplayRequest, x_role: str | None = Header(default=None)):
         require(_role(x_role), "manage_quarantine")
-        result = service.replay_pending(_reject_reason(body.reason))
+        if body.limit is not None and body.limit < 0:
+            raise HTTPException(status_code=422, detail="limit 必须为非负整数")
+        result = service.replay_pending(_reject_reason(body.reason), limit=body.limit)
         return {
             "triggered": result.triggered,
+            "processed": result.processed,
+            "limit": result.limit,
             "counts": result.counts(),
+            "summary": result.summary(),
             "results": [
                 {
                     "pending_id": r.pending_id,

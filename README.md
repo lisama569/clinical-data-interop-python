@@ -65,8 +65,10 @@
 
 ### 退出规则与生命周期
 
-- 状态流转：`pending` →（重放通过）→ `resolved`。`resolved` 记录保留在区内用于追溯，
-  不再参与批量重放候选。
+- 状态流转：`pending` →（重放通过）→ `resolved` →（容量需要时可能被淘汰）→
+  `evicted`。`resolved` 记录在活动区期间用于追溯，并会在批量重放中作为
+  “此前已解决、重复触发”被识别（结论 `already_resolved`）；被淘汰为 `evicted`
+  后进入归档仍可追溯，但不再参与任何重放。
 - `history` 完整记录每次事件的时间、动作（`rejected`/`replayed`）、当时失败类别、
   判定依据，以及重放通过时的记录级入库结论，可回答“何时因何被拒、何时被重放、结果如何”。
 - 重放后仍不通过的记录**继续留在待处理区**，其失败类别与依据更新为按**最新字典**
@@ -88,20 +90,56 @@
   | `still_failed` | 仍不通过，留在待处理区并更新最新类别/依据 |
   | `already_resolved` | 幂等命中：此前已解决，不重复处理 |
   | `skipped_busy` | 并发安全：同一刻已有重放在进行，本次跳过 |
-  | `not_found` | 待处理区无此记录（或已被容量淘汰），API 返回 404 |
+  | `evicted` | 记录已被容量淘汰归档，仍可查明细但不能再重放（接口返回 200） |
+  | `not_found` | 待处理区与归档中均无此记录，API 返回 404 |
 
 - 同一条记录同一时刻只允许一个重放（存储层 acquire/release 互斥），并发重复触发
   最多只有一个 `resolved`，其余得到 `skipped_busy`，不产生重复记录、不相互覆盖。
 
-### 容量与淘汰策略
+### 批量重放的四类跟进结论
+
+`POST /quarantine/replay`（可选 `reason` 限定类别、可选 `limit` 限制本轮**实际
+重放判定的 pending 条数**）对每条候选都给出独立结论，并用 `summary` 汇总四类，
+方便判断哪些还要继续跟进：
+
+| `summary` 字段 | 对应结论 | 含义 |
+| --- | --- | --- |
+| `resolved_now` | `resolved` | **本轮**重放通过并入库 |
+| `still_failed` | `still_failed` | **依然失败**，继续留在待处理区 |
+| `already_resolved` | `already_resolved` | **之前就已经解决**，本轮属于重复触发（廉价幂等查询，不受 `limit` 限制） |
+| `not_processed` | `not_processed` / `skipped_busy` | **本轮还没处理到**：超出本轮 `limit`，或并发占用被跳过 |
+
+- 候选 = 当前 pending 记录（可按 `reason` 过滤）+ 全部 resolved 记录；pending 优先
+  排序在前。响应还含 `triggered`（候选总数）、`processed`（本轮实际判定的 pending
+  数）、`limit` 与逐条 `results`（每条携带 pending 时的最新失败类别）。
+- `limit` 只截断需要重新解析判定的 pending 记录；已 resolved 的记录任何时候都直接
+  返回 `already_resolved`，因此“重复触发”不会挤占本轮处理额度。
+- 逐行 `results` 中的 `outcome` 保留细粒度结论（`skipped_busy` 与 `not_processed`
+  在 `summary` 中合并计入 `not_processed`）。
+
+### 容量与淘汰策略（新被拒记录永不丢失、淘汰后仍可追溯）
 
 - 容量上限可配置（`QuarantineStore(capacity=...)`，默认 1000；构建应用时可用
-  `create_app(..., quarantine_capacity=N)`）。
-- 达到上限时按**确定且可解释**的顺序淘汰：`created_at` 升序（进入序号同时刻决胜）
-  的**最早 pending 记录**。
-- **已解决（resolved）记录永不参与淘汰**；淘汰不改变其余记录的失败类别。
-- 若容量内全是 resolved、没有可淘汰的 pending 记录，新的被拒记录无法入区，
-  服务记录告警且不影响批次内其他记录（抛 `QuarantineFullError`，可在接入层决定重试策略）。
+  `create_app(..., quarantine_capacity=N)`）。容量只约束**活动区**（pending +
+  resolved），被淘汰记录进入独立的可追溯归档，不占容量。
+- **新被拒记录必定入区**：容量满时按确定顺序淘汰一条活动记录腾出位置
+  （`created_at` 升序、进入序号同时刻决胜）——优先淘汰最早的 **pending**；
+  若活动区里全是 resolved，则淘汰最早的 **resolved**。因此无论区内积压了多少
+  已解决历史，新的被拒记录都不会被静默丢弃，响应中的 `pending_id` 始终可定位。
+- **淘汰不等于消失**：被淘汰记录置为 `status=evicted` 并转入归档，
+  - 仍可通过 `GET /quarantine/records/{pending_id}` 查到，给出明确“已淘汰”结论；
+  - 列表接口默认同时返回活动与归档记录，可用 `?status=evicted` 只看归档；
+  - **保留失败类别**（`reason`）、`source_fragment` / `masked_payload` 与完整
+    `history`（进入被拒、每次重放、淘汰事件），可回答“当初因何被拒、是否被
+    重放过、何时被淘汰”；
+  - 仅供重放的原始报文 `payload` 在淘汰时清除，故归档记录**不可再重放**：
+    触发重放返回明确的 `evicted` 结论（HTTP 200，区别于查无此记录的 404）。
+- **淘汰不影响其他记录**：无论淘汰谁，仍在活动区里的其他记录的失败类别与
+  处理历史都不会被改动。
+- `GET /quarantine/records` 返回的 `stats` 含 `pending` / `resolved` / `evicted`
+  三个计数（`total` 只计活动区，`evicted` 为归档累计数）。
+- 旧版 `QuarantineFullError`（全 resolved 时拒绝入区）已不再抛出；异常类型保留
+  仅为向后兼容。
 
 ### 访问控制
 
@@ -117,10 +155,10 @@ GET  /patients/{patient_key}                    需 X-Role: clinician|admin
 GET  /export                                    需 X-Role: auditor|admin
 
 GET  /quarantine/records                        需 X-Role: auditor|admin
-        ?status=pending|resolved&reason=...&start=<ISO>&end=<ISO>&page=1&page_size=50
-GET  /quarantine/records/{pending_id}           需 X-Role: auditor|admin
+        ?status=pending|resolved|evicted&reason=...&start=<ISO>&end=<ISO>&page=1&page_size=50
+GET  /quarantine/records/{pending_id}           需 X-Role: auditor|admin（evicted 归档亦可查）
 POST /quarantine/records/{pending_id}/replay    需 X-Role: admin
-POST /quarantine/replay                         需 X-Role: admin；body: {"reason": null|"..."}
+POST /quarantine/replay                         需 X-Role: admin；body: {"reason": null|"...", "limit": null|N}
 
 POST /admin/codes                               需 X-Role: admin；{"code","display","unit"}
 POST /admin/codes/{code}/aliases                需 X-Role: admin；{"alias","target_code"}
@@ -147,7 +185,7 @@ GET  /export                   需 X-Role: auditor|admin
 ## 验证方法
 
 ```bash
-uv run pytest -q                                  # 全部测试（40 项）
+uv run pytest -q                                  # 全部测试（46 项）
 uv run pytest tests/test_parsers.py -q            # 畸形记录、缺字段、未知编码
 uv run pytest tests/test_idempotency.py -q        # 重复/并发提交、冲突
 uv run pytest tests/test_access_control.py -q     # 越权访问、脱敏不外泄
@@ -155,11 +193,27 @@ uv run pytest tests/test_quarantine.py -q         # 待处理区、重放、容�
 uv run uvicorn main:app --reload                  # 启动服务
 ```
 
+重点用例（本次容量/淘汰/批量重放相关）：
+
+```bash
+uv run pytest tests/test_quarantine.py -q -k "evicted or capacity or full"
+uv run pytest tests/test_quarantine.py -q -k "batch_replay"
+uv run pytest tests/test_quarantine.py -q -k "concurrent"   # 并发重放确定性
+```
+
 待处理区闭环的手动验证顺序：先 `POST /ingest/{batch}` 送入含未知编码的报文拿到
 `pending_id` → `GET /quarantine/records/{pending_id}`（auditor/admin）查看脱敏上下文 →
 `POST /admin/codes` 与 `/aliases`（admin）扩充字典 →
 `POST /quarantine/records/{pending_id}/replay` 观察 `resolved`，再次触发观察
-`already_resolved`；也可 `POST /quarantine/replay` 按类别批量重放。
+`already_resolved`；也可 `POST /quarantine/replay`（body 可带 `"limit": N`）
+按类别批量重放，从 `summary` 区分 `resolved_now` / `still_failed` /
+`already_resolved` / `not_processed`。
+
+容量与淘汰可在小容量下验证：以 `create_app(..., quarantine_capacity=1)` 起服务，
+连续 `POST /ingest` 送入两条被拒报文，第一条会被淘汰；再用
+`GET /quarantine/records?status=evicted` 与
+`GET /quarantine/records/{pending_id}` 可查到它的 `evicted` 状态、失败类别与
+完整处理历史；对其 `POST .../replay` 得到明确的 `evicted` 结论（200，而非 404）。
 
 测试日志（`logging`）会打印每条用例的输入摘要与判定依据，可用
 `uv run pytest --log-cli-level=INFO` 查看。
