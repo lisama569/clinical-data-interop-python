@@ -16,7 +16,7 @@ from typing import Any
 
 from app.codes import normalize_code
 from app.errors import RecordRejectedError
-from app.masking import mask_free_text, pseudonymize
+from app.masking import mask_payload_fragment, pseudonymize
 from app.models import (
     Encounter,
     NormalizedBundle,
@@ -28,7 +28,7 @@ from app.models import (
 
 
 def _reject(reason: RejectReason, detail: str, payload: str, salt: str) -> None:
-    fragment = mask_free_text(payload[:300], salt)
+    fragment = mask_payload_fragment(payload, salt)
     raise RecordRejectedError(Rejection(reason=reason, detail=detail, source_fragment=fragment))
 
 
@@ -122,7 +122,14 @@ def parse_fhir_json(payload: str, salt: str) -> NormalizedBundle:
         _require(bool(raw_code), f"Observation[{i}].code.coding[0].code 缺失", payload, salt)
         code = normalize_code(str(raw_code))
         if code is None:
-            _reject(RejectReason.UNKNOWN_CODE, f"无法识别的检验编码: {raw_code}", payload, salt)
+            raise RecordRejectedError(
+                Rejection(
+                    reason=RejectReason.UNKNOWN_CODE,
+                    detail=f"无法识别的检验编码: {raw_code}",
+                    source_fragment=mask_payload_fragment(payload, salt),
+                    code_token=str(raw_code).strip().upper(),
+                )
+            )
         vq = o.get("valueQuantity") or {}
         _require(vq.get("value") is not None, f"Observation[{i}].valueQuantity.value 缺失", payload, salt)
         obs_id = o.get("id") or f"{e['id']}#{i}"

@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 
 from app.errors import RecordRejectedError
-from app.masking import mask_free_text
+from app.masking import mask_payload_fragment
 from app.models import NormalizedBundle, Rejection, RejectReason
 from app.parsers.fhir_json import parse_fhir_json
 from app.parsers.hl7v2 import parse_hl7v2
@@ -35,7 +35,7 @@ def parse_record(payload: str, salt: str) -> NormalizedBundle:
             Rejection(
                 reason=RejectReason.MALFORMED_FORMAT,
                 detail="无法识别的交换格式（既非 FHIR JSON 也非 HL7 v2）",
-                source_fragment=mask_free_text(payload[:300], salt),
+                source_fragment=mask_payload_fragment(payload, salt),
             )
         )
     if fmt is ExchangeFormat.FHIR_JSON:

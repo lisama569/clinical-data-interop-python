@@ -3,6 +3,8 @@
 权限矩阵：
 - read_detail（明细查询）：clinician / admin
 - export（导出）：auditor / admin
+- read_quarantine（待处理区查阅）：auditor / admin
+- replay_quarantine（触发重放/字典更新）：admin
 所有拒绝只说明动作与角色，不包含任何原始敏感值。
 """
 from __future__ import annotations
@@ -21,6 +23,8 @@ class Role(str, Enum):
 _PERMISSIONS: dict[str, set[Role]] = {
     "read_detail": {Role.CLINICIAN, Role.ADMIN},
     "export": {Role.AUDITOR, Role.ADMIN},
+    "read_quarantine": {Role.AUDITOR, Role.ADMIN},
+    "replay_quarantine": {Role.ADMIN},
 }
 
 

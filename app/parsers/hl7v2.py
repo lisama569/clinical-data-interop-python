@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from app.codes import normalize_code
 from app.errors import RecordRejectedError
-from app.masking import mask_free_text, pseudonymize
+from app.masking import mask_payload_fragment, pseudonymize
 from app.models import (
     Encounter,
     NormalizedBundle,
@@ -23,7 +23,7 @@ from app.models import (
 
 
 def _reject(reason: RejectReason, detail: str, payload: str, salt: str) -> None:
-    fragment = mask_free_text(payload[:300], salt)
+    fragment = mask_payload_fragment(payload, salt)
     raise RecordRejectedError(Rejection(reason=reason, detail=detail, source_fragment=fragment))
 
 
@@ -80,7 +80,14 @@ def parse_hl7v2(payload: str, salt: str) -> NormalizedBundle:
             _reject(RejectReason.MISSING_REQUIRED_FIELD, f"OBX[{i}]-3 检验编码缺失", payload, salt)
         code = normalize_code(raw_code)
         if code is None:
-            _reject(RejectReason.UNKNOWN_CODE, f"无法识别的检验编码: {raw_code}", payload, salt)
+            raise RecordRejectedError(
+                Rejection(
+                    reason=RejectReason.UNKNOWN_CODE,
+                    detail=f"无法识别的检验编码: {raw_code}",
+                    source_fragment=mask_payload_fragment(payload, salt),
+                    code_token=raw_code.strip().upper(),
+                )
+            )
         value = _field(obx, 5)
         if not value:
             _reject(RejectReason.MISSING_REQUIRED_FIELD, f"OBX[{i}]-5 结果值缺失", payload, salt)

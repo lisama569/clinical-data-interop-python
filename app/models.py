@@ -20,6 +20,7 @@ class Rejection:
     reason: RejectReason
     detail: str
     source_fragment: str  # 原始报文中可定位的片段（已脱敏）
+    code_token: str | None = None  # 无法识别的原始编码令牌（仅 unknown_code，便于字典更新后定向重放）
 
 
 @dataclass(frozen=True)
