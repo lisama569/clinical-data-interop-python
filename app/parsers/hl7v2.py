@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from app.codes import normalize_code
+from app.codes import DEFAULT_REGISTRY, CodeRegistry
 from app.errors import RecordRejectedError
 from app.masking import mask_free_text, pseudonymize
 from app.models import (
@@ -38,7 +38,12 @@ def _field(seg: list[str], idx: int) -> str:
     return seg[idx].strip() if idx < len(seg) else ""
 
 
-def parse_hl7v2(payload: str, salt: str) -> NormalizedBundle:
+def parse_hl7v2(
+    payload: str,
+    salt: str,
+    registry: CodeRegistry | None = None,
+) -> NormalizedBundle:
+    reg = registry or DEFAULT_REGISTRY
     segs = _segments(payload, salt)
     pid = next((s for s in segs if s[0] == "PID"), None)
     obr = next((s for s in segs if s[0] == "OBR"), None)
@@ -78,7 +83,7 @@ def parse_hl7v2(payload: str, salt: str) -> NormalizedBundle:
         raw_code = _field(obx, 3).split("^")[0]
         if not raw_code:
             _reject(RejectReason.MISSING_REQUIRED_FIELD, f"OBX[{i}]-3 检验编码缺失", payload, salt)
-        code = normalize_code(raw_code)
+        code = reg.normalize_code(raw_code)
         if code is None:
             _reject(RejectReason.UNKNOWN_CODE, f"无法识别的检验编码: {raw_code}", payload, salt)
         value = _field(obx, 5)

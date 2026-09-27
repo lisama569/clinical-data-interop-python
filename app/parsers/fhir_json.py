@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app.codes import normalize_code
+from app.codes import DEFAULT_REGISTRY, CodeRegistry
 from app.errors import RecordRejectedError
 from app.masking import mask_free_text, pseudonymize
 from app.models import (
@@ -67,7 +67,12 @@ def _flatten(payload_obj: Any, payload: str, salt: str) -> dict[str, Any]:
     return {}  # pragma: no cover
 
 
-def parse_fhir_json(payload: str, salt: str) -> NormalizedBundle:
+def parse_fhir_json(
+    payload: str,
+    salt: str,
+    registry: CodeRegistry | None = None,
+) -> NormalizedBundle:
+    reg = registry or DEFAULT_REGISTRY
     try:
         obj = json.loads(payload)
     except (json.JSONDecodeError, TypeError):
@@ -120,7 +125,7 @@ def parse_fhir_json(payload: str, salt: str) -> NormalizedBundle:
         codings = (o.get("code") or {}).get("coding") or []
         raw_code = codings[0].get("code") if codings and isinstance(codings[0], dict) else None
         _require(bool(raw_code), f"Observation[{i}].code.coding[0].code 缺失", payload, salt)
-        code = normalize_code(str(raw_code))
+        code = reg.normalize_code(str(raw_code))
         if code is None:
             _reject(RejectReason.UNKNOWN_CODE, f"无法识别的检验编码: {raw_code}", payload, salt)
         vq = o.get("valueQuantity") or {}

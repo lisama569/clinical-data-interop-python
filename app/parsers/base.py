@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from enum import Enum
 
+from app.codes import DEFAULT_REGISTRY, CodeRegistry
 from app.errors import RecordRejectedError
 from app.masking import mask_free_text
 from app.models import NormalizedBundle, Rejection, RejectReason
@@ -27,8 +28,16 @@ def detect_format(payload: str) -> ExchangeFormat | None:
     return None
 
 
-def parse_record(payload: str, salt: str) -> NormalizedBundle:
-    """解析并归一一条源记录；失败抛出 RecordRejectedError。"""
+def parse_record(
+    payload: str,
+    salt: str,
+    registry: CodeRegistry | None = None,
+) -> NormalizedBundle:
+    """解析并归一一条源记录；失败抛出 RecordRejectedError。
+
+    registry 缺省时使用进程级默认字典；注入自定义注册表可读到运行时最新编码。
+    """
+    reg = registry or DEFAULT_REGISTRY
     fmt = detect_format(payload)
     if fmt is None:
         raise RecordRejectedError(
@@ -39,5 +48,5 @@ def parse_record(payload: str, salt: str) -> NormalizedBundle:
             )
         )
     if fmt is ExchangeFormat.FHIR_JSON:
-        return parse_fhir_json(payload, salt)
-    return parse_hl7v2(payload, salt)
+        return parse_fhir_json(payload, salt, reg)
+    return parse_hl7v2(payload, salt, reg)

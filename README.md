@@ -45,7 +45,98 @@
   `auditor`/`admin` 可导出汇总（`GET /export`）；
 - 未认证返回 401，越权返回 403，错误信息与日志中均不含原始敏感值（有测试保证）。
 
-## 接口
+## 被拒记录待处理区（quarantine）
+
+被拒记录不再只在当次响应中一闪而过，而是按可区分的失败类别**持久进入待处理区**，
+待检验项目字典扩充后可重新判定，形成“拒绝 → 待处理 → 重放 → 入库/继续待处理”的闭环。
+
+### 进入规则
+
+- 三类失败（`malformed_format` / `missing_required_field` / `unknown_code`）的记录
+  在当次响应返回 `rejected` 的同时进入待处理区，响应中附带 `pending_id` 可直接定位。
+- 每条记录保留**足以定位问题且已脱敏**的上下文：
+  - `source_fragment`：报文前 300 字符的脱敏片段；
+  - `masked_payload`：完整报文的脱敏版本（结构化遮蔽 FHIR `Patient.name` 与
+    HL7 `PID-5` 姓名，并假名化证件号/电话/长数字串）；
+  - 原始报文仅以私有字段 `payload` 保存供重放，**永不出现在任何列表、明细、
+    分页统计、错误响应与日志中**（对外统一走 `PendingRecord.to_view()`）。
+- 同一原始报文（以 HMAC 内容指纹判定）再次被拒时**幂等复用**同一条 pending 记录，
+  只追加一次“重复进入”历史，不新增记录、不重复计量。
+
+### 退出规则与生命周期
+
+- 状态流转：`pending` →（重放通过）→ `resolved`。`resolved` 记录保留在区内用于追溯，
+  不再参与批量重放候选。
+- `history` 完整记录每次事件的时间、动作（`rejected`/`replayed`）、当时失败类别、
+  判定依据，以及重放通过时的记录级入库结论，可回答“何时因何被拒、何时被重放、结果如何”。
+- 重放后仍不通过的记录**继续留在待处理区**，其失败类别与依据更新为按**最新字典**
+  得到的最新结论（例如编码补齐后，可能从 `unknown_code` 进一步暴露为
+  `missing_required_field`）。
+
+### 重放语义（幂等且并发安全）
+
+- 字典在**不重启服务**的前提下扩充：`POST /admin/codes` 新增编码，
+  `POST /admin/codes/{code}/aliases` 新增别名（目标编码必须已注册，别名不得静默改指向）。
+- 重放走与单条提交**完全一致**的解析与 upsert 路径，因此入库结论可复现：
+  `created` / `duplicate` / `conflict`；命中冲突时同样保留先到值、不覆盖，
+  冲突保护结论不会被重放抹掉。
+- 单条/并发触发的结论可区分：
+
+  | 结论 | 含义 |
+  | --- | --- |
+  | `resolved` | 本次重放通过并完成入库（附 `ingest_outcome`） |
+  | `still_failed` | 仍不通过，留在待处理区并更新最新类别/依据 |
+  | `already_resolved` | 幂等命中：此前已解决，不重复处理 |
+  | `skipped_busy` | 并发安全：同一刻已有重放在进行，本次跳过 |
+  | `not_found` | 待处理区无此记录（或已被容量淘汰），API 返回 404 |
+
+- 同一条记录同一时刻只允许一个重放（存储层 acquire/release 互斥），并发重复触发
+  最多只有一个 `resolved`，其余得到 `skipped_busy`，不产生重复记录、不相互覆盖。
+
+### 容量与淘汰策略
+
+- 容量上限可配置（`QuarantineStore(capacity=...)`，默认 1000；构建应用时可用
+  `create_app(..., quarantine_capacity=N)`）。
+- 达到上限时按**确定且可解释**的顺序淘汰：`created_at` 升序（进入序号同时刻决胜）
+  的**最早 pending 记录**。
+- **已解决（resolved）记录永不参与淘汰**；淘汰不改变其余记录的失败类别。
+- 若容量内全是 resolved、没有可淘汰的 pending 记录，新的被拒记录无法入区，
+  服务记录告警且不影响批次内其他记录（抛 `QuarantineFullError`，可在接入层决定重试策略）。
+
+### 访问控制
+
+- 查阅待处理区（列表/明细）：`auditor` / `admin`（动作 `read_quarantine`）；
+  无权限返回可理解的 401/403 拒绝，**不会**用空结果掩盖越权。
+- 触发重放与维护字典：仅 `admin`（动作 `manage_quarantine`）。
+
+### 接口
+
+```
+POST /ingest/{batch_id}                         {"records": ["<报文字符串>", ...]}
+GET  /patients/{patient_key}                    需 X-Role: clinician|admin
+GET  /export                                    需 X-Role: auditor|admin
+
+GET  /quarantine/records                        需 X-Role: auditor|admin
+        ?status=pending|resolved&reason=...&start=<ISO>&end=<ISO>&page=1&page_size=50
+GET  /quarantine/records/{pending_id}           需 X-Role: auditor|admin
+POST /quarantine/records/{pending_id}/replay    需 X-Role: admin
+POST /quarantine/replay                         需 X-Role: admin；body: {"reason": null|"..."}
+
+POST /admin/codes                               需 X-Role: admin；{"code","display","unit"}
+POST /admin/codes/{code}/aliases                需 X-Role: admin；{"alias","target_code"}
+```
+
+## 兼容范围
+
+- FHIR JSON / HL7 v2 的探测、必填字段、默认 LOINC 子集与别名均与既有行为一致；
+  原有解析、批次幂等、记录级 `created`/`duplicate`/`conflict` 语义不受影响。
+- 默认仍使用进程级全局编码字典（`app.codes.DEFAULT_REGISTRY`）；需要隔离字典或
+  重放闭环时，向 `IngestService` 注入自定义 `CodeRegistry` 与 `QuarantineStore` 即可，
+  旧的无参/两参构造方式继续可用。
+- 运行时字典扩充只影响**之后的解析与重放判定**，不会改写已经入库的观测值，
+  也不会改变已 resolved 记录的结论。
+
+## 接口（原有）
 
 ```
 POST /ingest/{batch_id}     {"records": ["<报文字符串>", ...]}
@@ -56,12 +147,19 @@ GET  /export                   需 X-Role: auditor|admin
 ## 验证方法
 
 ```bash
-uv run pytest -q                 # 全部测试（20 项）
-uv run pytest tests/test_parsers.py -q        # 畸形记录、缺字段、未知编码
-uv run pytest tests/test_idempotency.py -q    # 重复/并发提交、冲突
-uv run pytest tests/test_access_control.py -q # 越权访问、脱敏不外泄
-uv run uvicorn main:app --reload              # 启动服务
+uv run pytest -q                                  # 全部测试（40 项）
+uv run pytest tests/test_parsers.py -q            # 畸形记录、缺字段、未知编码
+uv run pytest tests/test_idempotency.py -q        # 重复/并发提交、冲突
+uv run pytest tests/test_access_control.py -q     # 越权访问、脱敏不外泄
+uv run pytest tests/test_quarantine.py -q         # 待处理区、重放、容量、权限、脱敏
+uv run uvicorn main:app --reload                  # 启动服务
 ```
+
+待处理区闭环的手动验证顺序：先 `POST /ingest/{batch}` 送入含未知编码的报文拿到
+`pending_id` → `GET /quarantine/records/{pending_id}`（auditor/admin）查看脱敏上下文 →
+`POST /admin/codes` 与 `/aliases`（admin）扩充字典 →
+`POST /quarantine/records/{pending_id}/replay` 观察 `resolved`，再次触发观察
+`already_resolved`；也可 `POST /quarantine/replay` 按类别批量重放。
 
 测试日志（`logging`）会打印每条用例的输入摘要与判定依据，可用
 `uv run pytest --log-cli-level=INFO` 查看。
