@@ -109,7 +109,11 @@ class IngestService:
         payload: str,
         exc: RecordRejectedError,
     ) -> str | None:
-        """把被拒记录安全地送入待处理区；容量满且无法淘汰时记录告警但不影响批次。"""
+        """把被拒记录送入待处理区。
+
+        容量规则保证新被拒记录总能入区（不足时淘汰一条在区记录，被淘汰者转 evicted
+        档案保留）；QuarantineFullError 仅为防御性兜底，正常流程不会发生。
+        """
         rejection = exc.rejection
         fmt = detect_format(payload)
         # 待处理区上下文统一做姓名+数字标识的强脱敏（遮蔽片段也以其为准）
@@ -158,6 +162,9 @@ class IngestService:
         if state == "not_found":
             logger.info("pending_id=%s 重放=not_found", pending_id)
             return ReplayResult(pending_id=pending_id, outcome=ReplayOutcome.NOT_FOUND)
+        if state == "evicted":
+            logger.info("pending_id=%s 重放=evicted（已淘汰档案，不可重放）", pending_id)
+            return ReplayResult(pending_id=pending_id, outcome=ReplayOutcome.EVICTED)
         if state == "already_resolved":
             logger.info("pending_id=%s 重放=already_resolved（幂等命中）", pending_id)
             return ReplayResult(pending_id=pending_id, outcome=ReplayOutcome.ALREADY_RESOLVED)
@@ -213,18 +220,21 @@ class IngestService:
         )
 
     def replay_pending(self, reason: RejectReason | None = None) -> ReplayBatchResult:
-        """对待处理区中的 pending 记录批量重放（可按失败类别限定）。
+        """对待处理区中的**在区**记录批量重放（pending 与 resolved，可按类别限定）。
 
-        逐条复用 replay_one，因此同样幂等且并发安全；重复触发只会让已解决者
-        命中 already_resolved，进行中者命中 skipped_busy，不会产生重复记录。
+        触发时先取一份在区快照，逐条复用 replay_one，因此同样幂等且并发安全：
+        本轮新通过 -> resolved；仍失败 -> still_failed；此前已解决者本轮重复触发 ->
+        already_resolved；因并发占用等本轮未处理到 -> skipped_busy（汇总归入
+        not_reached，留待下一轮跟进）。结论四类可区分，见 ReplayBatchResult.summary()。
         """
-        candidates = self._quarantine.candidates(reason)
+        candidates = self._quarantine.in_zone(reason)
         batch = ReplayBatchResult(triggered=len(candidates))
         for record in candidates:
             batch.results.append(self.replay_one(record.pending_id))
         logger.info(
-            "批量重放 候选=%d 结果分布=%s",
+            "批量重放 在区=%d 四类汇总=%s 原始分布=%s",
             batch.triggered,
+            batch.summary(),
             batch.counts(),
         )
         return batch

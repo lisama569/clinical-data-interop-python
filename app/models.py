@@ -89,6 +89,7 @@ class PendingStatus(str, Enum):
 
     PENDING = "pending"      # 仍在待处理区，尚未通过判定
     RESOLVED = "resolved"    # 重放后通过判定并完成入库
+    EVICTED = "evicted"      # 容量上限触发淘汰，已离开待处理区但保留可追溯档案
 
 
 class LifecycleAction(str, Enum):
@@ -96,7 +97,7 @@ class LifecycleAction(str, Enum):
 
     REJECTED = "rejected"      # 初次摄取被拒，进入待处理区
     REPLAYED = "replayed"      # 一次重放尝试（无论结果）
-    EVICTED = "evicted"        # 容量上限触发淘汰（只记录在历史日志，不留在区内）
+    EVICTED = "evicted"        # 容量上限触发淘汰；记录转为 evicted 档案，保留失败类别与完整历史
 
 
 class ReplayOutcome(str, Enum):
@@ -144,6 +145,7 @@ class PendingRecord:
     created_at: str = ""
     updated_at: str = ""
     resolved_at: str | None = None
+    evicted_at: str | None = None
     replay_count: int = 0
     history: list[HistoryEvent] = field(default_factory=list)
 
@@ -162,6 +164,7 @@ class PendingRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "resolved_at": self.resolved_at,
+            "evicted_at": self.evicted_at,
             "replay_count": self.replay_count,
             "history": [
                 {
@@ -189,13 +192,43 @@ class ReplayResult:
 
 @dataclass
 class ReplayBatchResult:
-    """一次批量重放的汇总。"""
+    """一次批量重放的汇总。
 
-    triggered: int = 0                              # 候选记录数
+    ``triggered`` 为本轮触发时纳入范围的记录数（按类别过滤后的全部在区记录，
+    含 pending 与已 resolved 者）；每条记录都有一条对应的 ``ReplayResult``。
+    """
+
+    triggered: int = 0                              # 本轮纳入范围的记录数
     results: list[ReplayResult] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
+        """逐条原始结论计数（``ReplayOutcome`` 值 -> 条数）。"""
         c: dict[str, int] = {}
         for r in self.results:
             c[r.outcome.value] = c.get(r.outcome.value, 0) + 1
         return c
+
+    def summary(self) -> dict[str, int]:
+        """面向跟进的四类结论汇总：
+
+        - ``resolved``：本轮重放新通过并入库；
+        - ``still_failed``：本轮处理了但仍失败，继续留在待处理区；
+        - ``already_resolved``：此前已解决，本轮属于重复触发，未重复处理；
+        - ``not_reached``：本轮未实际处理到（并发占用跳过等），仍需后续跟进。
+
+        四类之和恒等于 ``triggered``。
+        """
+        c = self.counts()
+        not_reached = (
+            c.get(ReplayOutcome.SKIPPED_BUSY.value, 0)
+            + c.get(ReplayOutcome.NOT_FOUND.value, 0)
+            + c.get(ReplayOutcome.EVICTED.value, 0)
+        )
+        return {
+            ReplayOutcome.RESOLVED.value: c.get(ReplayOutcome.RESOLVED.value, 0),
+            ReplayOutcome.STILL_FAILED.value: c.get(ReplayOutcome.STILL_FAILED.value, 0),
+            ReplayOutcome.ALREADY_RESOLVED.value: c.get(
+                ReplayOutcome.ALREADY_RESOLVED.value, 0
+            ),
+            "not_reached": not_reached,
+        }

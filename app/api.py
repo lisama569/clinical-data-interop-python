@@ -62,7 +62,10 @@ def _pending_status(value: str | None) -> PendingStatus | None:
     try:
         return PendingStatus(value)
     except ValueError:
-        raise HTTPException(status_code=422, detail=f"非法状态: {value}；可选 pending/resolved")
+        raise HTTPException(
+            status_code=422,
+            detail=f"非法状态: {value}；可选 pending/resolved/evicted",
+        )
 
 
 def create_app(
@@ -140,13 +143,14 @@ def create_app(
         require(_role(x_role), "read_quarantine")
         record = service.quarantine.get(pending_id)
         if record is None:
-            raise HTTPException(status_code=404, detail="待处理记录不存在或已被容量淘汰")
+            raise HTTPException(status_code=404, detail="待处理记录不存在（无此 pending_id）")
         return record.to_view()
 
     @app.post("/quarantine/records/{pending_id}/replay", response_model=None)
     def replay_one(pending_id: str, x_role: str | None = Header(default=None)):
         require(_role(x_role), "manage_quarantine")
         result = service.replay_one(pending_id)
+        # 只有“从不存在”返回 404；evicted 是可查到的明确结论，随 200 返回
         status_code = 404 if result.outcome.value == "not_found" else 200
         return JSONResponse(
             status_code=status_code,
@@ -160,11 +164,14 @@ def create_app(
         )
 
     @app.post("/quarantine/replay", response_model=None)
-    def replay_batch(body: BatchReplayRequest, x_role: str | None = Header(default=None)):
+    def replay_batch(body: BatchReplayRequest | None = None,
+                     x_role: str | None = Header(default=None)):
         require(_role(x_role), "manage_quarantine")
-        result = service.replay_pending(_reject_reason(body.reason))
+        reason = _reject_reason(body.reason) if body is not None else None
+        result = service.replay_pending(reason)
         return {
             "triggered": result.triggered,
+            "summary": result.summary(),
             "counts": result.counts(),
             "results": [
                 {
